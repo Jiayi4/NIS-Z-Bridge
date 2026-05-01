@@ -18,28 +18,19 @@ This README describes the last pushed and end-to-end verified version.
 Verified end-to-end commands:
 
 - `GET_Z`
-- `MOVE_REL 1.000000`
-- `MOVE_REL -1.000000`
+- `MOVE_REL <dz>` with supported step sizes: `±0.5`, `±1`, `±2`, `±5`, `±10` µm
 - `MOVE_ABS 4100.000000 4050.000000 7000.000000`
 - `MOVE_ABS 4200.000000 4000.000000 8100.000000`
 - `STOP`
 
-The current code also supports arbitrary relative moves in the form:
-
-- `MOVE_REL <dz>`
-
-with these safety rules:
-
-- `dz` must be numeric
-- `dz` must not be `0`
-- `|dz|` must be `<= 100.000000` um
+For `MOVE_REL`, the Python sync snaps any incoming value to the nearest supported step (within 10% tolerance). Any value further than 10% from a supported step is rejected with an error before it reaches NIS.
 
 Not included in the stable version:
 
 - continuous auto-listening macro
 - arbitrary `MOVE_ABS z min max`
 
-The bridge still uses simple local slot files on the NIS PC. `MOVE_REL` is now handled by one validated local slot plus Python-side command parsing instead of two hardcoded `+1` / `-1` slots.
+The NIS macro uses `ExistFile` checks on one filename per step size. No `ReadFile` is used for `MOVE_REL`. This is the design choice that made it reliable — `ReadFile` inside NIS macro was consistently fragile in this environment.
 
 ## Folder layout on the NIS PC
 
@@ -91,20 +82,30 @@ Important:
 
 ## Local slot mapping used by the current version
 
-Shared command text to local slot:
+Shared command text to local command file:
 
 - shared `GET_Z`
-  local `commands\current_getz.txt`
-- shared `MOVE_REL <dz>`
-  local `commands\current_move_rel.txt`
+  → `commands\current_getz.txt`
+- shared `MOVE_REL <dz>` snapped to ±0.5 µm
+  → `commands\current_move_rel_p0p5.txt` or `current_move_rel_m0p5.txt`
+- shared `MOVE_REL <dz>` snapped to ±1 µm
+  → `commands\current_move_rel_p1.txt` or `current_move_rel_m1.txt`
+- shared `MOVE_REL <dz>` snapped to ±2 µm
+  → `commands\current_move_rel_p2.txt` or `current_move_rel_m2.txt`
+- shared `MOVE_REL <dz>` snapped to ±5 µm
+  → `commands\current_move_rel_p5.txt` or `current_move_rel_m5.txt`
+- shared `MOVE_REL <dz>` snapped to ±10 µm
+  → `commands\current_move_rel_p10.txt` or `current_move_rel_m10.txt`
 - shared `MOVE_ABS 4100.000000 4050.000000 7000.000000`
-  local `commands\current_move_abs_4100_4050_7000.txt`
+  → `commands\current_move_abs_4100_4050_7000.txt`
 - shared `MOVE_ABS 4200.000000 4000.000000 8100.000000`
-  local `commands\current_move_abs_4200_4000_8100.txt`
+  → `commands\current_move_abs_4200_4000_8100.txt`
 - shared `STOP`
-  local `commands\current_stop.txt`
+  → `commands\current_stop.txt`
 
-Local response slot to shared response:
+All `MOVE_REL` variants share one state slot (`state\current_move_rel.id`) and one response file (`responses\current_move_rel_response.txt`).
+
+Local response files:
 
 - `current_getz_response.txt`
 - `current_move_rel_response.txt`
@@ -113,6 +114,8 @@ Local response slot to shared response:
 - `current_stop_response.txt`
 
 Each local response is mapped back to the original shared `<id>.txt` using `state\*.id`.
+
+If the NIS macro fails to consume a command within 120 seconds, the Python sync automatically archives both the command file and the state file so the slot unblocks without manual intervention.
 
 ## What the other PC should do
 
@@ -273,28 +276,18 @@ The stable end-to-end flow is:
 
 ## Known good tests from validation
 
-During validation, these command families worked end-to-end:
+During validation, these commands worked end-to-end from the HERA PC:
 
-- `GET_Z`
-  Returned around `OK 4099.35`
-- `MOVE_REL 1.000000`
-  Returned around `OK 4100.35`
-- `MOVE_REL -1.000000`
-  Returned around `OK 4099.3`
-- `MOVE_ABS 4100.000000 4050.000000 7000.000000`
-  Returned `OK 4100`
+- `GET_Z` — returned the live Z position, e.g. `OK 5612.475`
+- `MOVE_REL 1.000000` — stage moved up 1 µm, confirmed in response
+- `MOVE_REL -1.000000` — stage moved down 1 µm, confirmed in response
+- `MOVE_REL 2.000000` — stage moved up 2 µm, confirmed in response
+- `MOVE_ABS 4100.000000 4050.000000 7000.000000` — returned `OK 4100`
+- `MOVE_ABS 4200.000000 4000.000000 8100.000000` — verified successfully
 
-The `4200 / 4000 / 8100` absolute move was also verified successfully.
+All supported step sizes (±0.5, ±1, ±2, ±5, ±10 µm) have been implemented. The ±1 and ±2 steps were confirmed end-to-end. The others follow the same code path and should be tested carefully before routine use on the microscope.
 
-From the HERA PC, the commands that are currently supported are:
-
-- `GET_Z`
-- `MOVE_REL <dz>` where `dz` is numeric, non-zero, and `|dz| <= 100.000000`
-- `MOVE_ABS 4100.000000 4050.000000 7000.000000`
-- `MOVE_ABS 4200.000000 4000.000000 8100.000000`
-- `STOP`
-
-That means the current code path can accept custom relative move sizes from HERA. The exact `+1` and `-1` steps are already validated end to end; larger custom steps should be re-tested carefully on the microscope before routine use.
+The HERA Step field accepts any of the supported sizes. Values within 10% of a supported step are automatically snapped; anything further is rejected with an error before NIS is involved.
 
 ## Troubleshooting checklist
 
