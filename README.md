@@ -24,13 +24,22 @@ Verified end-to-end commands:
 - `MOVE_ABS 4200.000000 4000.000000 8100.000000`
 - `STOP`
 
+The current code also supports arbitrary relative moves in the form:
+
+- `MOVE_REL <dz>`
+
+with these safety rules:
+
+- `dz` must be numeric
+- `dz` must not be `0`
+- `|dz|` must be `<= 100.000000` um
+
 Not included in the stable version:
 
 - continuous auto-listening macro
 - arbitrary `MOVE_ABS z min max`
-- arbitrary `MOVE_REL dz`
 
-The stable version is a fixed-slot bridge. Only the exact commands above are forwarded.
+The bridge still uses simple local slot files on the NIS PC. `MOVE_REL` is now handled by one validated local slot plus Python-side command parsing instead of two hardcoded `+1` / `-1` slots.
 
 ## Folder layout on the NIS PC
 
@@ -80,16 +89,14 @@ Important:
 - Do not edit files in `forwarded\`.
 - `forwarded\` is only history, not an active queue.
 
-## Fixed-slot mapping used by the stable version
+## Local slot mapping used by the current version
 
 Shared command text to local slot:
 
 - shared `GET_Z`
   local `commands\current_getz.txt`
-- shared `MOVE_REL 1.000000`
-  local `commands\current_move_rel_p1.txt`
-- shared `MOVE_REL -1.000000`
-  local `commands\current_move_rel_m1.txt`
+- shared `MOVE_REL <dz>`
+  local `commands\current_move_rel.txt`
 - shared `MOVE_ABS 4100.000000 4050.000000 7000.000000`
   local `commands\current_move_abs_4100_4050_7000.txt`
 - shared `MOVE_ABS 4200.000000 4000.000000 8100.000000`
@@ -100,8 +107,7 @@ Shared command text to local slot:
 Local response slot to shared response:
 
 - `current_getz_response.txt`
-- `current_move_rel_p1_response.txt`
-- `current_move_rel_m1_response.txt`
+- `current_move_rel_response.txt`
 - `current_move_abs_4100_4050_7000_response.txt`
 - `current_move_abs_4200_4000_8100_response.txt`
 - `current_stop_response.txt`
@@ -131,6 +137,10 @@ MOVE_REL 1.000000
 
 ```text
 MOVE_REL -1.000000
+```
+
+```text
+MOVE_REL 5.000000
 ```
 
 ```text
@@ -198,7 +208,7 @@ The script will:
 
 - ensure local folders and shared folders exist
 - watch shared `commands\`
-- map supported shared commands into fixed local command slot files
+- map supported shared commands into local command slot files
 - store the original shared command id into local `state\`
 - move accepted shared commands into shared `forwarded\`
 - watch local `responses\`
@@ -215,8 +225,8 @@ The script will:
 
 Important:
 
-- In the stable version, the macro is a single-run worker, not a continuous listener.
-- One `Run` handles one currently present fixed-slot command and then exits.
+- The macro is a single-run worker, not a continuous listener.
+- One `Run` handles one currently present local command slot and then exits.
 - If a new command arrives later, run the macro again.
 
 ### Optional unattended trigger on the NIS PC
@@ -251,7 +261,7 @@ The stable end-to-end flow is:
 
 1. The other PC creates `shared\commands\<id>.txt`.
 2. Python sync reads the command text.
-3. Python sync maps it into a fixed local slot file under `E:\Jiayi\NISZBridge\commands\`.
+3. Python sync maps it into a local slot file under `E:\Jiayi\NISZBridge\commands\`.
 4. Python sync writes `state\<slot>.id` containing the original shared command id.
 5. Python sync moves the original shared file into shared `forwarded\`.
 6. The NIS operator runs the macro.
@@ -276,16 +286,15 @@ During validation, these command families worked end-to-end:
 
 The `4200 / 4000 / 8100` absolute move was also verified successfully.
 
-From the HERA PC, the commands that are currently supported are exactly:
+From the HERA PC, the commands that are currently supported are:
 
 - `GET_Z`
-- `MOVE_REL 1.000000`
-- `MOVE_REL -1.000000`
+- `MOVE_REL <dz>` where `dz` is numeric, non-zero, and `|dz| <= 100.000000`
 - `MOVE_ABS 4100.000000 4050.000000 7000.000000`
 - `MOVE_ABS 4200.000000 4000.000000 8100.000000`
 - `STOP`
 
-That means yes, you can move up and down from the HERA PC right now, but only by the tested fixed relative steps `+1` and `-1`, not arbitrary distances yet.
+That means the current code path can accept custom relative move sizes from HERA. The exact `+1` and `-1` steps are already validated end to end; larger custom steps should be re-tested carefully on the microscope before routine use.
 
 ## Troubleshooting checklist
 
@@ -362,9 +371,9 @@ The most reliable NIS pattern found during debugging was:
 - direct `StgGetPosZ(...)` and `StgMoveZ(...)`
 - minimal string handling
 
-### Why the bridge is fixed-slot
+### Why most of the bridge is still slot-based
 
-The fixed-slot design is not the final ideal architecture, but it was the stable one in this environment.
+The slot-based design is not the final ideal architecture, but it was the stable one in this environment.
 
 It avoids:
 
@@ -372,7 +381,7 @@ It avoids:
 - dynamic filename parsing inside NIS
 - complicated runtime string construction inside NIS
 
-That is why only specific command values are supported in this stable version.
+That is why `MOVE_ABS` remains fixed-value today even though `MOVE_REL` is now generalized through Python-side validation and one local macro slot.
 
 ### Notes for future macro upgrades
 

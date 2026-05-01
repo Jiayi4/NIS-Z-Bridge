@@ -31,7 +31,7 @@ The working path now includes:
 
 ## Current Stable Limitation
 
-The bridge is still intentionally limited to the fixed commands documented in the repo.
+At the time of this validation run, the bridge was still limited to the fixed commands documented in the repo.
 
 This was confirmed by a HERA-side failure when trying an unsupported command:
 
@@ -40,7 +40,7 @@ NIS Z: sending MOVE_REL +10.000000; waiting for NIS macro response...
 NIS Z MOVE_REL +10.000000 failed: Stable shared-folder bridge only supports Step 1.000000 for Move + and Move
 ```
 
-The currently validated shared-folder interface remains:
+The validated shared-folder interface from that run was:
 
 - `GET_Z`
 - `MOVE_REL 1.000000`
@@ -55,4 +55,10 @@ During debugging, a timing issue was observed: HERA can time out if the NIS macr
 
 ## Suggested Next Step
 
-If needed, the next improvement is to extend the bridge beyond fixed-slot commands so HERA can request arbitrary relative moves instead of only the validated `+1.000000` and `-1.000000` steps.
+The next improvement was to extend the bridge beyond fixed-slot commands so HERA could request arbitrary relative moves instead of only the validated `+1.000000` and `-1.000000` steps.
+
+Update after this note was written:
+
+- the local NIS-side bridge code now accepts `MOVE_REL <dz>` with Python-side validation
+- the current safety limit is `|dz| <= 100.000000` um and `dz != 0`
+- larger custom relative steps still need fresh end-to-end microscope validation
