@@ -5,34 +5,41 @@ This folder is the NIS-PC side of the Nikon Z bridge.
 The bridge is split into two parts:
 
 - `nis_z_sync_shared_to_local.py`
-  A normal Windows Python script that watches the shared NAS folder, maps supported shared commands into fixed local slot files, and publishes local responses back to the shared `responses\` folder.
+  A Windows Python script that watches the shared NAS folder, maps supported shared commands into local slot files, and publishes local responses back to the shared `responses\` folder.
 - `nis_z_local_text_bridge_watcher.mac`
   A NIS macro that only touches local paths under `E:\Jiayi\NISZBridge` and calls Nikon stage APIs.
 
 This separation is intentional. NIS should not read from or write to the UNC path directly.
 
-## Stable scope of this version
+## Current Status
 
-This README describes the last pushed and end-to-end verified version.
+This README reflects the real observed behavior from microscope testing on May 1, 2026.
 
-Verified end-to-end commands:
+Confirmed to work end-to-end:
 
 - `GET_Z`
-- `MOVE_REL <dz>` with supported step sizes: `±0.5`, `±1`, `±2`, `±5`, `±10` µm
+- `MOVE_REL 1.000000`
+- `MOVE_REL -1.000000`
 - `MOVE_ABS 4100.000000 4050.000000 7000.000000`
 - `MOVE_ABS 4200.000000 4000.000000 8100.000000`
 - `STOP`
 
-For `MOVE_REL`, the Python sync snaps any incoming value to the nearest supported step (within 10% tolerance). Any value further than 10% from a supported step is rejected with an error before it reaches NIS.
+Confirmed not reliable yet:
 
-Not included in the stable version:
+- generalized `MOVE_REL <dz>` using one local `current_move_rel.txt` file
+- dynamic reading of the relative step value inside the NIS macro
 
-- continuous auto-listening macro
-- arbitrary `MOVE_ABS z min max`
+Observed failure mode for the experimental generalized move path:
 
-The NIS macro uses `ExistFile` checks on one filename per step size. No `ReadFile` is used for `MOVE_REL`. This is the design choice that made it reliable — `ReadFile` inside NIS macro was consistently fragile in this environment.
+- HERA can send the request
+- the Python bridge can forward it to the NIS PC
+- the NIS macro can start
+- the macro has returned `ERROR ReadFile failed for MOVE_REL`
+- when the command stays pending, the hotkey runner may retrigger F4 multiple times because it only sees that the slot file still exists
 
-## Folder layout on the NIS PC
+So the stable shared-folder interface is still the fixed-command interface listed above.
+
+## Folder Layout On The NIS PC
 
 Main local root:
 
@@ -41,15 +48,15 @@ Main local root:
 Local folders:
 
 - `commands\`
-  Fixed local command slot files consumed by the NIS macro.
+  Local command slot files consumed by the NIS macro.
 - `responses\`
-  Fixed local response files produced by the NIS macro.
+  Local response files produced by the NIS macro.
 - `processed\`
   Local archive for processed command and response files.
 - `errors\`
   Local archive for failed command files.
 - `state\`
-  Local mapping files that let the Python sync script map a fixed local slot back to the original shared command id.
+  Local mapping files that let the Python sync script map a local slot back to the original shared command id.
 
 Main files:
 
@@ -59,7 +66,7 @@ Main files:
 - [README.md](</E:/Jiayi/NISZBridge/README.md>)
 - `nis_z_sync.log`
 
-## Shared-folder contract
+## Shared-Folder Contract
 
 Shared root:
 
@@ -80,44 +87,41 @@ Important:
 - Do not edit files in `forwarded\`.
 - `forwarded\` is only history, not an active queue.
 
-## Local slot mapping used by the current version
+## Stable Local Slot Mapping
 
 Shared command text to local command file:
 
 - shared `GET_Z`
-  → `commands\current_getz.txt`
-- shared `MOVE_REL <dz>` snapped to ±0.5 µm
-  → `commands\current_move_rel_p0p5.txt` or `current_move_rel_m0p5.txt`
-- shared `MOVE_REL <dz>` snapped to ±1 µm
-  → `commands\current_move_rel_p1.txt` or `current_move_rel_m1.txt`
-- shared `MOVE_REL <dz>` snapped to ±2 µm
-  → `commands\current_move_rel_p2.txt` or `current_move_rel_m2.txt`
-- shared `MOVE_REL <dz>` snapped to ±5 µm
-  → `commands\current_move_rel_p5.txt` or `current_move_rel_m5.txt`
-- shared `MOVE_REL <dz>` snapped to ±10 µm
-  → `commands\current_move_rel_p10.txt` or `current_move_rel_m10.txt`
+  -> `commands\current_getz.txt`
+- shared `MOVE_REL 1.000000`
+  -> `commands\current_move_rel_p1.txt`
+- shared `MOVE_REL -1.000000`
+  -> `commands\current_move_rel_m1.txt`
 - shared `MOVE_ABS 4100.000000 4050.000000 7000.000000`
-  → `commands\current_move_abs_4100_4050_7000.txt`
+  -> `commands\current_move_abs_4100_4050_7000.txt`
 - shared `MOVE_ABS 4200.000000 4000.000000 8100.000000`
-  → `commands\current_move_abs_4200_4000_8100.txt`
+  -> `commands\current_move_abs_4200_4000_8100.txt`
 - shared `STOP`
-  → `commands\current_stop.txt`
-
-All `MOVE_REL` variants share one state slot (`state\current_move_rel.id`) and one response file (`responses\current_move_rel_response.txt`).
+  -> `commands\current_stop.txt`
 
 Local response files:
 
 - `current_getz_response.txt`
-- `current_move_rel_response.txt`
+- `current_move_rel_p1_response.txt`
+- `current_move_rel_m1_response.txt`
 - `current_move_abs_4100_4050_7000_response.txt`
 - `current_move_abs_4200_4000_8100_response.txt`
 - `current_stop_response.txt`
 
 Each local response is mapped back to the original shared `<id>.txt` using `state\*.id`.
 
-If the NIS macro fails to consume a command within 120 seconds, the Python sync automatically archives both the command file and the state file so the slot unblocks without manual intervention.
+Experimental branch notes:
 
-## What the other PC should do
+- a newer local experiment uses `commands\current_move_rel.txt`
+- that path can receive forwarded commands from HERA
+- that path is not reliable in the macro yet because the macro-side file read failed during live tests
+
+## What The Other PC Should Do
 
 The other PC only needs access to the shared NAS folder.
 
@@ -143,10 +147,6 @@ MOVE_REL -1.000000
 ```
 
 ```text
-MOVE_REL 5.000000
-```
-
-```text
 MOVE_ABS 4100.000000 4050.000000 7000.000000
 ```
 
@@ -167,35 +167,14 @@ Expected response format:
 - `OK <z_um>`
 - `ERROR <message>`
 
-## Recommended PowerShell example on the other PC
-
-```powershell
-$id = [guid]::NewGuid().ToString("N")
-$root = "\\sti-nas1.rcp.epfl.ch\bios\bios-raw\backups\visible\cell\Jiayi_bios-raw\Z control shared"
-$cmd = Join-Path $root "commands\$id.txt"
-$resp = Join-Path $root "responses\$id.txt"
-
-Set-Content -LiteralPath $cmd -Value "GET_Z" -Encoding ascii
-Write-Host "Command sent: $cmd"
-
-for($i = 0; $i -lt 30; $i++) {
-    if(Test-Path $resp) {
-        Write-Host "Response received:"
-        Get-Content $resp
-        break
-    }
-    Start-Sleep -Seconds 1
-}
-```
-
-## What the NIS PC operator should do
+## What The NIS PC Operator Should Do
 
 The NIS PC has two roles:
 
 - keep the Python sync script running
 - open NIS and run the macro when a command should be processed
 
-### 1. Start the Python sync script
+### 1. Start The Python Sync Script
 
 From Windows PowerShell on the NIS PC:
 
@@ -219,7 +198,7 @@ The script will:
 - archive published local responses into local `processed\`
 - append runtime logs to `nis_z_sync.log`
 
-### 2. Run the NIS macro
+### 2. Run The NIS Macro
 
 1. Open NIS-Elements on the NIS PC.
 2. Make sure NIS is connected to the microscope and stage.
@@ -232,19 +211,13 @@ Important:
 - One `Run` handles one currently present local command slot and then exits.
 - If a new command arrives later, run the macro again.
 
-### Optional unattended trigger on the NIS PC
+### Optional Unattended Trigger On The NIS PC
 
-If repeated manual clicks are the main pain point, you can trigger the stable single-run macro from Windows instead of trying to keep the macro itself in an infinite listener loop.
+If repeated manual clicks are the main pain point, you can trigger the single-run macro from Windows instead of trying to keep the macro itself in an infinite listener loop.
 
 This repo includes:
 
 - [nis_z_macro_hotkey_runner.ps1](</E:/Jiayi/NISZBridge/nis_z_macro_hotkey_runner.ps1>)
-
-What it does:
-
-- watches `E:\Jiayi\NISZBridge\commands\` for pending local slot files
-- activates the NIS window by title
-- sends a configurable hotkey to trigger the macro again
 
 Example:
 
@@ -256,40 +229,38 @@ Important:
 
 - the exact NIS window title may need adjustment
 - on this setup, `F4` runs the current macro
-- test this carefully with `GET_Z` before trusting it for unattended motion
+- if a command stays stuck in a local slot, the hotkey runner may keep retriggering F4 every few seconds
 
-## End-to-end flow
+To stop the hotkey runner cleanly:
 
-The stable end-to-end flow is:
+```powershell
+New-Item -ItemType File -Path E:\Jiayi\NISZBridge\stop_hotkey_runner.txt -Force
+```
 
-1. The other PC creates `shared\commands\<id>.txt`.
-2. Python sync reads the command text.
-3. Python sync maps it into a local slot file under `E:\Jiayi\NISZBridge\commands\`.
-4. Python sync writes `state\<slot>.id` containing the original shared command id.
-5. Python sync moves the original shared file into shared `forwarded\`.
-6. The NIS operator runs the macro.
-7. The macro checks the fixed slot file and executes the matching Nikon stage action.
-8. The macro writes a fixed local response file under `responses\`.
-9. The macro moves the consumed local command into `processed\` or `errors\`.
-10. Python sync sees the local response, reads the matching `state\*.id`, and writes the final result into shared `responses\<id>.txt`.
-11. Python sync archives the local response into local `processed\`.
-
-## Known good tests from validation
+## Known Good Tests
 
 During validation, these commands worked end-to-end from the HERA PC:
 
-- `GET_Z` — returned the live Z position, e.g. `OK 5612.475`
-- `MOVE_REL 1.000000` — stage moved up 1 µm, confirmed in response
-- `MOVE_REL -1.000000` — stage moved down 1 µm, confirmed in response
-- `MOVE_REL 2.000000` — stage moved up 2 µm, confirmed in response
-- `MOVE_ABS 4100.000000 4050.000000 7000.000000` — returned `OK 4100`
-- `MOVE_ABS 4200.000000 4000.000000 8100.000000` — verified successfully
+- `GET_Z` - returned the live Z position
+- `MOVE_REL 1.000000` - stage moved up 1 um
+- `MOVE_REL -1.000000` - stage moved down 1 um
+- `MOVE_ABS 4100.000000 4050.000000 7000.000000` - returned `OK 4100`
+- `MOVE_ABS 4200.000000 4000.000000 8100.000000` - verified successfully
+- `STOP` - returned the current Z position
 
-All supported step sizes (±0.5, ±1, ±2, ±5, ±10 µm) have been implemented. The ±1 and ±2 steps were confirmed end-to-end. The others follow the same code path and should be tested carefully before routine use on the microscope.
+## What Did Not Work Reliably
 
-The HERA Step field accepts any of the supported sizes. Values within 10% of a supported step are automatically snapped; anything further is rejected with an error before NIS is involved.
+The following behavior was observed during the generalized move experiment:
 
-## Troubleshooting checklist
+- HERA sent values such as `MOVE_REL 2.000000`
+- the Python bridge forwarded them into `commands\current_move_rel.txt`
+- the macro started and created trace files such as `found_current_move_rel.txt`
+- the macro returned `ERROR ReadFile failed for MOVE_REL`
+- no actual move result reached HERA for that path
+
+This means the failure is inside the NIS macro before `StgMoveZ(...)` is called.
+
+## Troubleshooting Checklist
 
 If a new shared command stays in shared `commands\`:
 
@@ -305,11 +276,19 @@ If the command reached local `commands\` but no shared response appears:
 
 - Check whether the NIS macro has been run.
 - Check local `responses\`, `processed\`, and `errors\`.
+- If the hotkey runner is active, it may keep retriggering while the local command file remains stuck.
 
 If a local response exists but no shared response appears:
 
 - Check `nis_z_sync.log`
 - Check whether the matching `state\*.id` file still exists
+
+If the shared response says `ERROR ReadFile failed for MOVE_REL`:
+
+- The command reached the NIS PC.
+- The failure is inside the NIS macro, before `StgMoveZ(...)` is called.
+- Reload the macro inside NIS and re-test.
+- If it still fails, treat the dynamic file-read approach as unreliable in this environment.
 
 Useful places to inspect:
 
@@ -320,42 +299,34 @@ Useful places to inspect:
 - `E:\Jiayi\NISZBridge\state`
 - `E:\Jiayi\NISZBridge\nis_z_sync.log`
 
-## NIS macro pitfalls and lessons learned
+## NIS Macro Pitfalls And Lessons Learned
 
-These points were learned during debugging and should be kept in mind if the macro is upgraded later.
-
-### Architecture pitfalls
+Architecture pitfalls:
 
 - Do not let the NIS macro read or write the UNC path directly.
 - Keep the NIS macro local-only.
 - Let Python handle shared-folder movement and shared-folder bookkeeping.
 
-### Nikon API pitfalls
+Nikon API pitfalls:
 
 - Do not use `StgZ_GetLimits`.
-  In earlier testing this caused NIS to close.
-- `STOP` should be treated conservatively.
-  In this bridge it returns the current Z only; it does not forcibly interrupt a running `StgMoveZ`.
+- `STOP` should be treated conservatively. In this bridge it returns the current Z only; it does not forcibly interrupt a running `StgMoveZ`.
 
-### Macro language pitfalls
+Macro language pitfalls:
 
 - Keep the macro simple.
 - Prefer a single `main()`.
 - Avoid helper functions unless they are proven safe in this exact NIS environment.
-- Avoid complex C-style abstractions. They were much less reliable than direct linear code.
+- Avoid complex C-style abstractions.
 
 Observed pain points:
 
 - `ReadFile(...)` for command text was unreliable in this workflow.
-- Dynamic command parsing was fragile.
-- `sprintf(..., "%s", ...)` caused failures in string path building.
-- Pointer-heavy string handling such as `strrchr(...)` based path parsing was fragile.
-- Comment-heavy or more complex macro files sometimes behaved unexpectedly during testing.
-- A macro that looked syntactically fine could still silently fail in the interpreter.
+- dynamic command parsing was fragile
+- pointer-heavy string handling was fragile
+- a macro that looked syntactically fine could still silently fail in the interpreter
 
-### Stable pattern that worked
-
-The most reliable NIS pattern found during debugging was:
+Stable pattern that worked:
 
 - fixed local file names
 - one command family per explicit branch
@@ -364,37 +335,10 @@ The most reliable NIS pattern found during debugging was:
 - direct `StgGetPosZ(...)` and `StgMoveZ(...)`
 - minimal string handling
 
-### Why most of the bridge is still slot-based
+## Safety Notes
 
-The slot-based design is not the final ideal architecture, but it was the stable one in this environment.
-
-It avoids:
-
-- command text parsing inside NIS
-- dynamic filename parsing inside NIS
-- complicated runtime string construction inside NIS
-
-That is why `MOVE_ABS` remains fixed-value today even though `MOVE_REL` is now generalized through Python-side validation and one local macro slot.
-
-### Notes for future macro upgrades
-
-On May 1, 2026, a continuous-listener macro was tested locally and was not reliable enough to treat as stable in this NIS environment.
-
-For now, the stable path remains the single-run worker plus the Python bridge.
-
-Recommended principles for later work:
-
-- keep the macro local-only
-- keep a single `main()`
-- introduce looping only after the single-run version is still preserved
-- add one new feature at a time and validate it immediately
-- avoid rebuilding a generic command parser too early
-- prefer a very small data protocol if dynamic parameters are needed later
-
-## Safety notes
-
-- The NIS macro only reads and writes `E:/Jiayi/NISZBridge/...`.
+- The NIS macro should only read and write `E:/Jiayi/NISZBridge/...`.
 - Do not modify it to access the shared UNC path directly.
 - Do not use `StgZ_GetLimits`.
-- Keep relative validation moves small.
+- Keep validation moves small.
 - Only use absolute moves whose ranges have been reviewed by the microscope operator.
