@@ -24,7 +24,7 @@ Verified end-to-end commands:
 - `MOVE_ABS 4200.000000 4000.000000 8100.000000`
 - `STOP`
 
-Not included in this stable version:
+Not included in the stable version:
 
 - continuous auto-listening macro
 - arbitrary `MOVE_ABS z min max`
@@ -55,6 +55,7 @@ Main files:
 
 - [nis_z_sync_shared_to_local.py](</E:/Jiayi/NISZBridge/nis_z_sync_shared_to_local.py>)
 - [nis_z_local_text_bridge_watcher.mac](</E:/Jiayi/NISZBridge/nis_z_local_text_bridge_watcher.mac>)
+- [nis_z_macro_hotkey_runner.ps1](</E:/Jiayi/NISZBridge/nis_z_macro_hotkey_runner.ps1>)
 - [README.md](</E:/Jiayi/NISZBridge/README.md>)
 - `nis_z_sync.log`
 
@@ -214,9 +215,35 @@ The script will:
 
 Important:
 
-- In this stable version, the macro is a single-run worker, not a continuous listener.
-- That means one `Run` handles one currently present fixed-slot command and then exits.
+- In the stable version, the macro is a single-run worker, not a continuous listener.
+- One `Run` handles one currently present fixed-slot command and then exits.
 - If a new command arrives later, run the macro again.
+
+### Optional unattended trigger on the NIS PC
+
+If repeated manual clicks are the main pain point, you can trigger the stable single-run macro from Windows instead of trying to keep the macro itself in an infinite listener loop.
+
+This repo includes:
+
+- [nis_z_macro_hotkey_runner.ps1](</E:/Jiayi/NISZBridge/nis_z_macro_hotkey_runner.ps1>)
+
+What it does:
+
+- watches `E:\Jiayi\NISZBridge\commands\` for pending local slot files
+- activates the NIS window by title
+- sends a configurable hotkey to trigger the macro again
+
+Example:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\nis_z_macro_hotkey_runner.ps1 -WindowTitleContains "NIS" -RunHotkey "{F4}"
+```
+
+Important:
+
+- the exact NIS window title may need adjustment
+- on this setup, `F4` runs the current macro
+- test this carefully with `GET_Z` before trusting it for unattended motion
 
 ## End-to-end flow
 
@@ -248,6 +275,17 @@ During validation, these command families worked end-to-end:
   Returned `OK 4100`
 
 The `4200 / 4000 / 8100` absolute move was also verified successfully.
+
+From the HERA PC, the commands that are currently supported are exactly:
+
+- `GET_Z`
+- `MOVE_REL 1.000000`
+- `MOVE_REL -1.000000`
+- `MOVE_ABS 4100.000000 4050.000000 7000.000000`
+- `MOVE_ABS 4200.000000 4000.000000 8100.000000`
+- `STOP`
+
+That means yes, you can move up and down from the HERA PC right now, but only by the tested fixed relative steps `+1` and `-1`, not arbitrary distances yet.
 
 ## Troubleshooting checklist
 
@@ -336,9 +374,11 @@ It avoids:
 
 That is why only specific command values are supported in this stable version.
 
-### Notes for a future continuous-listener upgrade
+### Notes for future macro upgrades
 
-A future auto-listening macro is still possible, but should start from the stable constraints above.
+On May 1, 2026, a continuous-listener macro was tested locally and was not reliable enough to treat as stable in this NIS environment.
+
+For now, the stable path remains the single-run worker plus the Python bridge.
 
 Recommended principles for later work:
 

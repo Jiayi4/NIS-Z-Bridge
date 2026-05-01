@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import shutil
 import signal
 import sys
 import time
@@ -24,6 +23,7 @@ LOCAL_STATE_DIR = LOCAL_ROOT / "state"
 LOG_PATH = LOCAL_ROOT / "nis_z_sync.log"
 POLL_INTERVAL_SECONDS = 1.0
 COMMAND_SUFFIX = ".txt"
+ORPHAN_RECOVERY_AGE_SECONDS = 5.0
 
 COMMAND_SLOT_MAP = {
     "GET_Z": "current_getz",
@@ -78,10 +78,18 @@ def iter_txt_files(folder: Path) -> Iterable[Path]:
     )
 
 
-def copy_text_file(source: Path, destination: Path) -> None:
-    temp_destination = destination.with_suffix(destination.suffix + ".tmp")
-    shutil.copyfile(source, temp_destination)
-    temp_destination.replace(destination)
+def read_text_file_best_effort(path: Path) -> str:
+    data = path.read_bytes()
+    for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be", "ascii"):
+        try:
+            text = data.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = data.decode("utf-8", errors="replace")
+
+    return text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def write_text_file(destination: Path, text: str) -> None:
@@ -102,6 +110,70 @@ def state_file_for_slot(slot_name: str) -> Path:
     return LOCAL_STATE_DIR / f"{slot_name}.id"
 
 
+def age_seconds(path: Path) -> float:
+    return max(0.0, time.time() - path.stat().st_mtime)
+
+
+def archive_orphan_path(path: Path, reason: str) -> Path:
+    archived_path = archive_name_conflict(LOCAL_ERRORS_DIR / f"{path.stem}__{reason}{path.suffix}")
+    path.replace(archived_path)
+    return archived_path
+
+
+def recover_orphan_local_command(slot_name: str, local_command: Path, slot_state: Path) -> bool:
+    if not local_command.exists() or slot_state.exists():
+        return False
+
+    command_age = age_seconds(local_command)
+    if command_age < ORPHAN_RECOVERY_AGE_SECONDS:
+        return False
+
+    archived_path = archive_orphan_path(local_command, "orphan_command")
+    logging.warning(
+        "Recovered orphan local command for slot %s by archiving %s to %s",
+        slot_name,
+        local_command,
+        archived_path,
+    )
+    return True
+
+
+def recover_orphan_local_response(local_response: Path, slot_name: str) -> bool:
+    slot_state = state_file_for_slot(slot_name)
+    if not local_response.exists() or slot_state.exists():
+        return False
+
+    response_age = age_seconds(local_response)
+    if response_age < ORPHAN_RECOVERY_AGE_SECONDS:
+        return False
+
+    archived_path = archive_orphan_path(local_response, "orphan_response")
+    logging.warning(
+        "Recovered orphan local response for slot %s by archiving %s to %s",
+        slot_name,
+        local_response,
+        archived_path,
+    )
+    return True
+
+
+def recover_orphan_local_artifacts() -> int:
+    recovered = 0
+
+    for slot_name in COMMAND_SLOT_MAP.values():
+        local_command = LOCAL_COMMANDS_DIR / f"{slot_name}.txt"
+        slot_state = state_file_for_slot(slot_name)
+        if recover_orphan_local_command(slot_name, local_command, slot_state):
+            recovered += 1
+
+    for response_name, slot_name in RESPONSE_SLOT_MAP.items():
+        local_response = LOCAL_RESPONSES_DIR / response_name
+        if recover_orphan_local_response(local_response, slot_name):
+            recovered += 1
+
+    return recovered
+
+
 def forward_shared_commands() -> int:
     forwarded = 0
 
@@ -120,6 +192,7 @@ def forward_shared_commands() -> int:
 
         local_command = LOCAL_COMMANDS_DIR / f"{slot_name}.txt"
         slot_state = state_file_for_slot(slot_name)
+        recover_orphan_local_command(slot_name, local_command, slot_state)
         if local_command.exists() or slot_state.exists():
             logging.warning("Local slot is busy, leaving shared command in place: %s", slot_name)
             continue
@@ -161,6 +234,7 @@ def publish_local_responses() -> int:
 
         slot_state = state_file_for_slot(slot_name)
         if not slot_state.exists():
+            recover_orphan_local_response(local_response, slot_name)
             logging.warning("Ignoring local response without slot state: %s", local_response)
             continue
 
@@ -168,8 +242,9 @@ def publish_local_responses() -> int:
             response_id = slot_state.read_text(encoding="ascii").strip()
             shared_response = SHARED_RESPONSES_DIR / f"{response_id}.txt"
             processed_response = archive_name_conflict(LOCAL_PROCESSED_DIR / f"{response_id}__{local_response.name}")
+            response_text = read_text_file_best_effort(local_response).strip()
 
-            copy_text_file(local_response, shared_response)
+            write_text_file(shared_response, response_text + "\n")
             local_response.replace(processed_response)
             slot_state.unlink()
             logging.info(
@@ -204,10 +279,11 @@ def main() -> int:
     logging.info("Local root: %s", LOCAL_ROOT)
 
     while not _STOP_REQUESTED:
+        recovered = recover_orphan_local_artifacts()
         forwarded = forward_shared_commands()
         published = publish_local_responses()
 
-        if forwarded == 0 and published == 0:
+        if recovered == 0 and forwarded == 0 and published == 0:
             time.sleep(POLL_INTERVAL_SECONDS)
 
     logging.info("NIS Z fixed-slot shared/local sync bridge stopped.")

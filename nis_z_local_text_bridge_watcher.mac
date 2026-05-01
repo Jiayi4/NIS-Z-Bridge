@@ -171,6 +171,23 @@ int main()
         return 1;
     }
 
+    if(ExistFile("E:/Jiayi/NISZBridge/commands/current_stop.txt") == 1)
+    {
+        rc = StgGetPosZ(&z, 0);
+        if(rc != 1)
+        {
+            sprintf(response, "ERROR StgGetPosZ failed %d", rc);
+            WriteFile("E:/Jiayi/NISZBridge/responses/current_stop_response.txt", response, strlen(response) * 2);
+            RenameFile("E:/Jiayi/NISZBridge/errors/current_stop.txt", "E:/Jiayi/NISZBridge/commands/current_stop.txt");
+            return rc;
+        }
+
+        sprintf(response, "OK %.6f", z);
+        WriteFile("E:/Jiayi/NISZBridge/responses/current_stop_response.txt", response, strlen(response) * 2);
+        RenameFile("E:/Jiayi/NISZBridge/processed/current_stop.txt", "E:/Jiayi/NISZBridge/commands/current_stop.txt");
+        return 1;
+    }
+
     WriteFile("E:/Jiayi/NISZBridge/responses/no_known_command.txt", "no known command", 40);
     return 0;
 }
