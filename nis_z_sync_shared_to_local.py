@@ -25,6 +25,7 @@ LOG_PATH = LOCAL_ROOT / "nis_z_sync.log"
 POLL_INTERVAL_SECONDS = 1.0
 COMMAND_SUFFIX = ".txt"
 ORPHAN_RECOVERY_AGE_SECONDS = 5.0
+STUCK_SLOT_AGE_SECONDS = 120.0
 MOVE_REL_PREFIX = "MOVE_REL "
 MOVE_REL_SLOT = "current_move_rel"
 
@@ -169,6 +170,23 @@ def archive_orphan_path(path: Path, reason: str) -> Path:
     return archived_path
 
 
+def recover_stuck_slot(slot_name: str, local_command: Path, slot_state: Path) -> bool:
+    """Archive both command and state when both exist but the macro never consumed the command."""
+    if not local_command.exists() or not slot_state.exists():
+        return False
+    if age_seconds(local_command) < STUCK_SLOT_AGE_SECONDS:
+        return False
+    archived_cmd = archive_orphan_path(local_command, "stuck_command")
+    archive_orphan_path(slot_state, "stuck_state")
+    logging.warning(
+        "Recovered stuck slot %s: command %s was not consumed for >%ds, archived both files",
+        slot_name,
+        archived_cmd,
+        STUCK_SLOT_AGE_SECONDS,
+    )
+    return True
+
+
 def recover_orphan_local_command(slot_name: str, local_command: Path, slot_state: Path) -> bool:
     if not local_command.exists() or slot_state.exists():
         return False
@@ -212,13 +230,18 @@ def recover_orphan_local_artifacts() -> int:
     for slot_name in FIXED_SLOTS:
         local_command = LOCAL_COMMANDS_DIR / f"{slot_name}.txt"
         slot_state = state_file_for_slot(slot_name)
-        if recover_orphan_local_command(slot_name, local_command, slot_state):
+        if recover_stuck_slot(slot_name, local_command, slot_state):
+            recovered += 1
+        elif recover_orphan_local_command(slot_name, local_command, slot_state):
             recovered += 1
 
     move_rel_state = state_file_for_slot(MOVE_REL_SLOT)
     for file_base in _MOVE_REL_STEP_MAP.values():
         local_command = LOCAL_COMMANDS_DIR / f"{file_base}.txt"
-        if recover_orphan_local_command(MOVE_REL_SLOT, local_command, move_rel_state):
+        if recover_stuck_slot(MOVE_REL_SLOT, local_command, move_rel_state):
+            recovered += 1
+            break
+        elif recover_orphan_local_command(MOVE_REL_SLOT, local_command, move_rel_state):
             recovered += 1
             break
 
