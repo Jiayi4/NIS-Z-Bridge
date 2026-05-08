@@ -10,3 +10,6 @@ sync_stderr.log
 nis_z_local_fixed_get_probe.mac
 nis_z_findfiles_probe.mac
 nis_z_local_write_probe.mac
+github-mirror/
+github_downloads/
+hera-trigger-app/

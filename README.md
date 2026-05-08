@@ -13,7 +13,7 @@ This separation is intentional. NIS should not read from or write to the UNC pat
 
 ## Current Status
 
-This README reflects the real observed behavior from microscope testing on May 1, 2026.
+This README reflects the real observed behavior from microscope testing on May 1, 2026 and follow-up bridge checks on May 8, 2026.
 
 Confirmed to work end-to-end:
 
@@ -39,6 +39,13 @@ Observed failure mode for the experimental generalized move path:
 
 So the stable shared-folder interface is still the fixed-command interface listed above.
 
+Additional findings from May 8, 2026:
+
+- end-to-end `GET_Z` still works through the shared-folder bridge when the sync script, macro, and hotkey runner are all running
+- the sync script had to be relaxed to accept integer-form `OK` responses such as `OK 56`, not only decimal-form responses such as `OK 56.000000`
+- the NIS macro must be reloaded explicitly inside NIS-Elements after editing the `.mac` file on disk; saving the file is not enough
+- one live unresolved issue remains: the bridge can return `OK 56` even when the microscope operator reports the true Z axis is around `5698.200`, so connectivity is working but the exact NIS Z value returned by `StgGetPosZ(&z, 0)` may be the wrong coordinate source for this microscope configuration
+
 ## Folder Layout On The NIS PC
 
 Main local root:
@@ -62,7 +69,10 @@ Main files:
 
 - [nis_z_sync_shared_to_local.py](</E:/Jiayi/NISZBridge/nis_z_sync_shared_to_local.py>)
 - [nis_z_local_text_bridge_watcher.mac](</E:/Jiayi/NISZBridge/nis_z_local_text_bridge_watcher.mac>)
+- [nis_z_local_text_bridge_watcher_loop.mac](</E:/Jiayi/NISZBridge/nis_z_local_text_bridge_watcher_loop.mac>) - experimental continuous-listener variant, not the default stable macro
 - [nis_z_macro_hotkey_runner.ps1](</E:/Jiayi/NISZBridge/nis_z_macro_hotkey_runner.ps1>)
+- [test_get_z.ps1](</E:/Jiayi/NISZBridge/test_get_z.ps1>)
+- [check_bridge_status.ps1](</E:/Jiayi/NISZBridge/check_bridge_status.ps1>)
 - [README.md](</E:/Jiayi/NISZBridge/README.md>)
 - `nis_z_sync.log`
 
@@ -237,6 +247,74 @@ To stop the hotkey runner cleanly:
 New-Item -ItemType File -Path E:\Jiayi\NISZBridge\stop_hotkey_runner.txt -Force
 ```
 
+## Recommended Test Workflow
+
+Use this order when validating the bridge. It saves time and makes it much easier to see which layer is broken.
+
+### 1. Macro-only test first
+
+Create the local slot file directly:
+
+```powershell
+Set-Content .\commands\current_getz.txt "GET_Z"
+```
+
+Then press `F4` manually inside NIS-Elements and inspect:
+
+```powershell
+Get-ChildItem .\responses | Sort-Object LastWriteTime -Descending | Select-Object -First 10 Name,LastWriteTime
+Get-Content .\responses\current_getz_response.txt -Raw
+```
+
+If this local-only test fails, the problem is inside NIS or the currently loaded macro, not in Python sync or the shared NAS folder.
+
+### 2. Full shared-folder test
+
+Once the local macro test works, start:
+
+- `nis_z_sync_shared_to_local.py`
+- `nis_z_macro_hotkey_runner.ps1`
+
+Then run:
+
+```powershell
+.\test_get_z.ps1
+```
+
+This writes a fresh shared `GET_Z` command and waits for the shared response file.
+
+### 3. Status snapshot during a live test
+
+While a test is running or right after it finishes, run:
+
+```powershell
+.\check_bridge_status.ps1
+```
+
+This prints:
+
+- whether the sync process is running
+- whether the hotkey runner is running
+- latest files in `commands`, `responses`, `state`, `processed`, and `errors`
+- recent sync-log lines
+
+Best moments to use it:
+
+- immediately after starting sync and hotkey runner
+- 5 to 10 seconds after running `.\test_get_z.ps1`
+- immediately after a timeout
+- immediately after pressing `Ctrl+C` in the sync terminal to confirm the process really stopped
+
+### 4. Layer-by-layer debugging rule
+
+If a test fails, debug one layer at a time:
+
+1. macro only
+2. local macro plus local command/response files
+3. sync plus manual `F4`
+4. sync plus hotkey runner
+5. full shared-folder test
+
 ## Known Good Tests
 
 During validation, these commands worked end-to-end from the HERA PC:
@@ -260,6 +338,12 @@ The following behavior was observed during the generalized move experiment:
 
 This means the failure is inside the NIS macro before `StgMoveZ(...)` is called.
 
+Another unresolved reliability issue:
+
+- a successful `GET_Z` bridge response can still report the wrong numeric Z value for the microscope
+- one observed response was `OK 56` while the operator reported the real Z axis value was `5698.200`
+- that means the bridge transport path worked, but the exact Nikon API call or stage channel used by the macro may still be wrong for the real Z axis source
+
 ## Troubleshooting Checklist
 
 If a new shared command stays in shared `commands\`:
@@ -282,6 +366,20 @@ If a local response exists but no shared response appears:
 
 - Check `nis_z_sync.log`
 - Check whether the matching `state\*.id` file still exists
+
+If a test times out but the sync log later shows both:
+
+- `Forwarded shared command ...`
+- `Published local response ...`
+
+then the bridge itself succeeded and the timeout is likely in the test harness reading the NAS response file while it is still briefly locked by another process.
+
+If you edit the macro and your new debug files do not appear:
+
+- close the old macro tab in NIS-Elements
+- reopen `nis_z_local_text_bridge_watcher.mac` from disk
+- make sure the reopened tab is the one bound to `F4`
+- re-run a local macro-only test before trusting the shared-folder bridge again
 
 If the shared response says `ERROR ReadFile failed for MOVE_REL`:
 

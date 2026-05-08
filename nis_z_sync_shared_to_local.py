@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import logging
-import math
+import os
+import re
+import shutil
 import signal
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -24,45 +27,32 @@ LOCAL_STATE_DIR = LOCAL_ROOT / "state"
 LOG_PATH = LOCAL_ROOT / "nis_z_sync.log"
 POLL_INTERVAL_SECONDS = 1.0
 COMMAND_SUFFIX = ".txt"
-ORPHAN_RECOVERY_AGE_SECONDS = 5.0
-STUCK_SLOT_AGE_SECONDS = 120.0
-MOVE_REL_PREFIX = "MOVE_REL "
-MOVE_REL_SLOT = "current_move_rel"
+SHARED_COMMAND_MAX_AGE_SECONDS = 180.0
+STALE_LOCAL_SLOT_SECONDS = 120.0
+COMMAND_TIMESTAMP_RE = re.compile(r"(20\d{6}_\d{6})")
+COMPLETE_RESPONSE_RE = re.compile(r"^(ERROR\b.*|OK\s+[-+]?\d+(?:\.\d+)?(?:\s+.*)?)$")
 
-# Each supported relative step (µm) maps to a local command filename base.
-# The NIS macro uses ExistFile on these names — no ReadFile needed.
-_MOVE_REL_STEP_MAP: dict[float, str] = {
-     0.5: "current_move_rel_p0p5",
-     1.0: "current_move_rel_p1",
-     2.0: "current_move_rel_p2",
-     5.0: "current_move_rel_p5",
-    10.0: "current_move_rel_p10",
-    -0.5: "current_move_rel_m0p5",
-    -1.0: "current_move_rel_m1",
-    -2.0: "current_move_rel_m2",
-    -5.0: "current_move_rel_m5",
-   -10.0: "current_move_rel_m10",
-}
-_MOVE_REL_ABS_STEPS = sorted(s for s in _MOVE_REL_STEP_MAP if s > 0)
-
-FIXED_COMMAND_SLOT_MAP = {
+COMMAND_SLOT_MAP = {
     "GET_Z": "current_getz",
+    "MOVE_REL 1.000000": "current_move_rel_p1",
+    "MOVE_REL -1.000000": "current_move_rel_m1",
     "MOVE_ABS 4100.000000 4050.000000 7000.000000": "current_move_abs_4100_4050_7000",
     "MOVE_ABS 4200.000000 4000.000000 8100.000000": "current_move_abs_4200_4000_8100",
     "STOP": "current_stop",
 }
 
-FIXED_SLOTS = tuple(FIXED_COMMAND_SLOT_MAP.values())
-
 RESPONSE_SLOT_MAP = {
     "current_getz_response.txt": "current_getz",
-    "current_move_rel_response.txt": MOVE_REL_SLOT,
+    "current_move_rel_p1_response.txt": "current_move_rel_p1",
+    "current_move_rel_m1_response.txt": "current_move_rel_m1",
     "current_move_abs_4100_4050_7000_response.txt": "current_move_abs_4100_4050_7000",
     "current_move_abs_4200_4000_8100_response.txt": "current_move_abs_4200_4000_8100",
     "current_stop_response.txt": "current_stop",
 }
+SLOT_RESPONSE_MAP = {slot_name: response_name for response_name, slot_name in RESPONSE_SLOT_MAP.items()}
 
 _STOP_REQUESTED = False
+_LAST_STALE_BACKLOG_LOG_AT = 0.0
 
 
 def configure_logging() -> None:
@@ -74,6 +64,15 @@ def configure_logging() -> None:
             logging.StreamHandler(sys.stdout),
         ],
     )
+
+
+def sleep_until_next_poll(seconds: float) -> None:
+    deadline = time.time() + max(0.0, seconds)
+    while not _STOP_REQUESTED:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
 
 
 def ensure_directories() -> None:
@@ -91,24 +90,76 @@ def ensure_directories() -> None:
 
 
 def iter_txt_files(folder: Path) -> Iterable[Path]:
-    return sorted(
-        (path for path in folder.glob(f"*{COMMAND_SUFFIX}") if path.is_file()),
-        key=lambda path: (path.stat().st_mtime, path.name),
+    try:
+        names = os.listdir(folder)
+    except FileNotFoundError:
+        return []
+
+    return [
+        folder / name
+        for name in sorted(names)
+        if name.lower().endswith(COMMAND_SUFFIX)
+    ]
+
+
+def command_timestamp_seconds(path: Path) -> float | None:
+    match = COMMAND_TIMESTAMP_RE.search(path.stem)
+    if not match:
+        return None
+
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d_%H%M%S").timestamp()
+    except ValueError:
+        return None
+
+
+def newest_fresh_shared_command() -> Path | None:
+    global _LAST_STALE_BACKLOG_LOG_AT
+
+    commands = list(iter_txt_files(SHARED_COMMANDS_DIR))
+    if not commands:
+        return None
+
+    now = time.time()
+    fresh_commands = []
+    stale_count = 0
+    unknown_timestamp_count = 0
+
+    for command in commands:
+        timestamp = command_timestamp_seconds(command)
+        if timestamp is None:
+            unknown_timestamp_count += 1
+            fresh_commands.append(command)
+            continue
+
+        if now - timestamp > SHARED_COMMAND_MAX_AGE_SECONDS:
+            stale_count += 1
+            continue
+
+        fresh_commands.append(command)
+
+    if stale_count and now - _LAST_STALE_BACKLOG_LOG_AT > 30.0:
+        logging.info(
+            "Ignoring %d stale shared command file(s); %d fresh file(s), %d without timestamp.",
+            stale_count,
+            len(fresh_commands),
+            unknown_timestamp_count,
+        )
+        _LAST_STALE_BACKLOG_LOG_AT = now
+
+    if not fresh_commands:
+        return None
+
+    return max(
+        fresh_commands,
+        key=lambda path: (command_timestamp_seconds(path) or 0.0, path.name),
     )
 
 
-def read_text_file_best_effort(path: Path) -> str:
-    data = path.read_bytes()
-    for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be", "ascii"):
-        try:
-            text = data.decode(encoding)
-            break
-        except UnicodeDecodeError:
-            continue
-    else:
-        text = data.decode("utf-8", errors="replace")
-
-    return text.replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+def copy_text_file(source: Path, destination: Path) -> None:
+    temp_destination = destination.with_suffix(destination.suffix + ".tmp")
+    shutil.copyfile(source, temp_destination)
+    temp_destination.replace(destination)
 
 
 def write_text_file(destination: Path, text: str) -> None:
@@ -129,165 +180,110 @@ def state_file_for_slot(slot_name: str) -> Path:
     return LOCAL_STATE_DIR / f"{slot_name}.id"
 
 
-def _snap_move_rel_step(step_um: float) -> float:
-    abs_step = abs(step_um)
-    best_abs = min(_MOVE_REL_ABS_STEPS, key=lambda s: abs(abs_step - s))
-    if abs(abs_step - best_abs) / best_abs > 0.10:
-        raise ValueError(
-            f"MOVE_REL {step_um:.6f} um is not close to a supported step. "
-            f"Supported: ±{_MOVE_REL_ABS_STEPS} um"
-        )
-    return math.copysign(best_abs, step_um)
-
-
-def classify_shared_command(command_text: str) -> tuple[str, str, str]:
-    """Returns (slot_name, command_file_base, local_command_text)."""
-    slot_name = FIXED_COMMAND_SLOT_MAP.get(command_text)
-    if slot_name is not None:
-        return slot_name, slot_name, command_text
-
-    if command_text.startswith(MOVE_REL_PREFIX):
-        try:
-            step_um = float(command_text[len(MOVE_REL_PREFIX):])
-        except ValueError:
-            raise KeyError(command_text)
-        if not math.isfinite(step_um) or step_um == 0.0:
-            raise ValueError(f"Invalid MOVE_REL step: {command_text!r}")
-        snapped = _snap_move_rel_step(step_um)
-        file_base = _MOVE_REL_STEP_MAP[snapped]
-        return MOVE_REL_SLOT, file_base, command_text
-
-    raise KeyError(command_text)
+def response_file_for_slot(slot_name: str) -> Path | None:
+    response_name = SLOT_RESPONSE_MAP.get(slot_name)
+    if response_name is None:
+        return None
+    return LOCAL_RESPONSES_DIR / response_name
 
 
 def age_seconds(path: Path) -> float:
     return max(0.0, time.time() - path.stat().st_mtime)
 
 
-def archive_orphan_path(path: Path, reason: str) -> Path:
-    archived_path = archive_name_conflict(LOCAL_ERRORS_DIR / f"{path.stem}__{reason}{path.suffix}")
-    path.replace(archived_path)
-    return archived_path
+def archive_local_file(source: Path, archive_root: Path, reason: str) -> Path:
+    destination = archive_name_conflict(archive_root / f"{source.stem}__{reason}{source.suffix}")
+    source.replace(destination)
+    return destination
 
 
-def recover_stuck_slot(slot_name: str, local_command: Path, slot_state: Path) -> bool:
-    """Archive both command and state when both exist but the macro never consumed the command."""
-    if not local_command.exists() or not slot_state.exists():
-        return False
-    if age_seconds(local_command) < STUCK_SLOT_AGE_SECONDS:
-        return False
-    archived_cmd = archive_orphan_path(local_command, "stuck_command")
-    archive_orphan_path(slot_state, "stuck_state")
-    logging.warning(
-        "Recovered stuck slot %s: command %s was not consumed for >%ds, archived both files",
-        slot_name,
-        archived_cmd,
-        STUCK_SLOT_AGE_SECONDS,
-    )
-    return True
-
-
-def recover_orphan_local_command(slot_name: str, local_command: Path, slot_state: Path) -> bool:
-    if not local_command.exists() or slot_state.exists():
-        return False
-
-    command_age = age_seconds(local_command)
-    if command_age < ORPHAN_RECOVERY_AGE_SECONDS:
-        return False
-
-    archived_path = archive_orphan_path(local_command, "orphan_command")
-    logging.warning(
-        "Recovered orphan local command for slot %s by archiving %s to %s",
-        slot_name,
-        local_command,
-        archived_path,
-    )
-    return True
-
-
-def recover_orphan_local_response(local_response: Path, slot_name: str) -> bool:
-    slot_state = state_file_for_slot(slot_name)
-    if not local_response.exists() or slot_state.exists():
-        return False
-
-    response_age = age_seconds(local_response)
-    if response_age < ORPHAN_RECOVERY_AGE_SECONDS:
-        return False
-
-    archived_path = archive_orphan_path(local_response, "orphan_response")
-    logging.warning(
-        "Recovered orphan local response for slot %s by archiving %s to %s",
-        slot_name,
-        local_response,
-        archived_path,
-    )
-    return True
-
-
-def recover_orphan_local_artifacts() -> int:
-    recovered = 0
-
-    for slot_name in FIXED_SLOTS:
-        local_command = LOCAL_COMMANDS_DIR / f"{slot_name}.txt"
+def recover_stale_local_slots() -> None:
+    for local_command in iter_txt_files(LOCAL_COMMANDS_DIR):
+        slot_name = local_command.stem
         slot_state = state_file_for_slot(slot_name)
-        if recover_stuck_slot(slot_name, local_command, slot_state):
-            recovered += 1
-        elif recover_orphan_local_command(slot_name, local_command, slot_state):
-            recovered += 1
+        if age_seconds(local_command) <= STALE_LOCAL_SLOT_SECONDS:
+            continue
 
-    move_rel_state = state_file_for_slot(MOVE_REL_SLOT)
-    for file_base in _MOVE_REL_STEP_MAP.values():
-        local_command = LOCAL_COMMANDS_DIR / f"{file_base}.txt"
-        if recover_stuck_slot(MOVE_REL_SLOT, local_command, move_rel_state):
-            recovered += 1
-            break
-        elif recover_orphan_local_command(MOVE_REL_SLOT, local_command, move_rel_state):
-            recovered += 1
-            break
+        slot_response = response_file_for_slot(slot_name)
+        if slot_response is not None and slot_response.exists() and is_complete_response(slot_response):
+            continue
 
-    for response_name, slot_name in RESPONSE_SLOT_MAP.items():
-        local_response = LOCAL_RESPONSES_DIR / response_name
-        if recover_orphan_local_response(local_response, slot_name):
-            recovered += 1
+        if slot_state.exists():
+            archived_command = archive_local_file(local_command, LOCAL_ERRORS_DIR, "stale_local_command")
+            archived_state = archive_local_file(slot_state, LOCAL_ERRORS_DIR, "state_for_stale_command")
+            logging.warning(
+                "Archived stale local command %s -> %s and state %s -> %s",
+                local_command,
+                archived_command,
+                slot_state,
+                archived_state,
+            )
+            if slot_response is not None and slot_response.exists():
+                archived_response = archive_local_file(slot_response, LOCAL_ERRORS_DIR, "response_for_stale_command")
+                logging.warning("Archived stale local response %s -> %s", slot_response, archived_response)
+            continue
 
-    return recovered
+        archived = archive_local_file(local_command, LOCAL_ERRORS_DIR, "orphan_local_command")
+        logging.warning("Archived orphan local command %s -> %s", local_command, archived)
+
+
+def response_text(local_response: Path) -> str:
+    return local_response.read_text(encoding="ascii", errors="ignore").replace("\x00", "").strip()
+
+
+def is_complete_response(local_response: Path) -> bool:
+    try:
+        text = response_text(local_response)
+    except OSError:
+        return False
+
+    return bool(COMPLETE_RESPONSE_RE.match(text))
 
 
 def forward_shared_commands() -> int:
     forwarded = 0
 
-    for shared_command in iter_txt_files(SHARED_COMMANDS_DIR):
+    shared_command = newest_fresh_shared_command()
+    if shared_command is None:
+        return 0
+
+    for shared_command in [shared_command]:
         archived_command = archive_name_conflict(SHARED_FORWARDED_DIR / shared_command.name)
 
         try:
             command_text = shared_command.read_text(encoding="ascii").strip()
-            slot_name, command_file_base, local_command_text = classify_shared_command(command_text)
+            slot_name = COMMAND_SLOT_MAP[command_text]
         except KeyError:
             logging.error("Unsupported shared command text: %s", shared_command)
-            continue
-        except ValueError as exc:
-            logging.error("Rejected shared command %s: %s", shared_command, exc)
             continue
         except Exception as exc:
             logging.exception("Failed to parse shared command %s: %s", shared_command, exc)
             continue
 
-        local_command = LOCAL_COMMANDS_DIR / f"{command_file_base}.txt"
+        local_command = LOCAL_COMMANDS_DIR / f"{slot_name}.txt"
         slot_state = state_file_for_slot(slot_name)
-        recover_orphan_local_command(slot_name, local_command, slot_state)
         if local_command.exists() or slot_state.exists():
             logging.warning("Local slot is busy, leaving shared command in place: %s", slot_name)
             continue
 
+        # Clear any leftover processed command file so the macro's RenameFile
+        # doesn't collide with a stale copy from a previous cycle.
+        processed_command = LOCAL_PROCESSED_DIR / f"{slot_name}.txt"
+        if processed_command.exists():
+            try:
+                processed_command.unlink()
+                logging.info("Cleared stale processed command file: %s", processed_command)
+            except OSError as exc:
+                logging.warning("Could not clear stale processed command %s: %s", processed_command, exc)
+
         try:
-            write_text_file(local_command, local_command_text + "\n")
+            write_text_file(local_command, command_text + "\n")
             write_text_file(slot_state, shared_command.stem + "\n")
             shared_command.replace(archived_command)
             logging.info(
-                "Forwarded shared command %s into slot %s as %r and archived to %s",
+                "Forwarded shared command %s into slot %s and archived to %s",
                 shared_command,
                 slot_name,
-                local_command_text,
                 archived_command,
             )
             forwarded += 1
@@ -315,9 +311,20 @@ def publish_local_responses() -> int:
         if slot_name is None:
             continue
 
+        if not is_complete_response(local_response):
+            try:
+                incomplete_text = response_text(local_response)
+            except OSError as exc:
+                incomplete_text = f"<unreadable: {exc}>"
+            logging.warning(
+                "Waiting for complete local response in %s: %r",
+                local_response,
+                incomplete_text,
+            )
+            continue
+
         slot_state = state_file_for_slot(slot_name)
         if not slot_state.exists():
-            recover_orphan_local_response(local_response, slot_name)
             logging.warning("Ignoring local response without slot state: %s", local_response)
             continue
 
@@ -325,9 +332,8 @@ def publish_local_responses() -> int:
             response_id = slot_state.read_text(encoding="ascii").strip()
             shared_response = SHARED_RESPONSES_DIR / f"{response_id}.txt"
             processed_response = archive_name_conflict(LOCAL_PROCESSED_DIR / f"{response_id}__{local_response.name}")
-            response_text = read_text_file_best_effort(local_response).strip()
 
-            write_text_file(shared_response, response_text + "\n")
+            copy_text_file(local_response, shared_response)
             local_response.replace(processed_response)
             slot_state.unlink()
             logging.info(
@@ -346,30 +352,38 @@ def publish_local_responses() -> int:
 def request_stop(signum: int, _frame: object) -> None:
     global _STOP_REQUESTED
     _STOP_REQUESTED = True
-    logging.info("Received signal %s, stopping after current poll cycle.", signum)
+    try:
+        logging.info("Stop requested (signal %s).", signum)
+    except Exception:
+        pass
 
 
 def main() -> int:
+    global _STOP_REQUESTED
     ensure_directories()
     configure_logging()
+
+    logging.info("Starting NIS Z fixed-slot shared/local sync bridge.")
+    logging.info("Shared root: %s", SHARED_ROOT)
+    logging.info("Local root: %s", LOCAL_ROOT)
 
     signal.signal(signal.SIGINT, request_stop)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, request_stop)
 
-    logging.info("Starting NIS Z shared/local sync bridge.")
-    logging.info("Shared root: %s", SHARED_ROOT)
-    logging.info("Local root: %s", LOCAL_ROOT)
+    try:
+        while not _STOP_REQUESTED:
+            recover_stale_local_slots()
+            forwarded = forward_shared_commands()
+            published = publish_local_responses()
 
-    while not _STOP_REQUESTED:
-        recovered = recover_orphan_local_artifacts()
-        forwarded = forward_shared_commands()
-        published = publish_local_responses()
+            if forwarded == 0 and published == 0:
+                sleep_until_next_poll(POLL_INTERVAL_SECONDS)
+    except KeyboardInterrupt:
+        _STOP_REQUESTED = True
+        logging.info("NIS Z fixed-slot shared/local sync bridge interrupted by user.")
 
-        if recovered == 0 and forwarded == 0 and published == 0:
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-    logging.info("NIS Z shared/local sync bridge stopped.")
+    logging.info("NIS Z fixed-slot shared/local sync bridge stopped.")
     return 0
 
 
